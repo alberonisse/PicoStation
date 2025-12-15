@@ -24,6 +24,9 @@ extern picostation::I2S m_i2s;
 extern pseudoatomic<uint32_t> g_fileArg;
 extern pseudoatomic<picostation::FileListingStates> needFileCheckAction;
 extern pseudoatomic<int> listReadyState;
+extern pseudoatomic<int> artFileReady;
+
+
 
 static bool dir = 0;
 static bool trk_dir = 0;
@@ -243,6 +246,14 @@ void __time_critical_func(picostation::MechCommand::processLatchedCommand)()
 					}
 					break;
 				}
+
+                case COMMAND_READ_ART_FILE:
+                {
+                    DEBUG_PRINT("READ_ART_FILE\n");
+                    needFileCheckAction = FileListingStates::PROCESS_READ_ART_FILE;
+                    artFileReady = 0;
+                    break;
+                }
 				
 				case COMMAND_EXTENDED:
 				{
