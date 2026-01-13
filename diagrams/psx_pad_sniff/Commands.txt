@@ -1,0 +1,3 @@
+Short Reset: START + SELECT + L2 + R2
+
+Long Reset: SELECT + L2 + R2 + X
