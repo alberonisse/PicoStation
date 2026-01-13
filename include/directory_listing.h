@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 namespace picostation {
+
 class DirectoryListing {
   public:
     
@@ -17,11 +18,14 @@ class DirectoryListing {
 	static uint16_t getDirectoryEntriesCount();
 	static uint16_t* getFileListingData();
 
-
-    
     static uint16_t getCueCount();
     static bool buildArtFile(const uint32_t indexFile);
-    static uint16_t* getArtFileData();
+    
+    static uint16_t* getAlbFileCurrentData();
+    static bool advanceAlbFile(uint8_t requested);
+    static uint8_t getAlbFileCurrentSector();  
+    static void cancelAlbFile();  
+    
     
   private:
 	static void combinePaths(const char* filePath1, const char* filePath2, char* newPath);

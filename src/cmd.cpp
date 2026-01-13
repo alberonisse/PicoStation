@@ -27,7 +27,6 @@ extern pseudoatomic<int> listReadyState;
 extern pseudoatomic<int> artFileReady;
 
 
-
 static bool dir = 0;
 static bool trk_dir = 0;
 static bool prev_dir = 0;
@@ -254,7 +253,14 @@ void __time_critical_func(picostation::MechCommand::processLatchedCommand)()
                     artFileReady = 0;
                     break;
                 }
-				
+                case COMMAND_READ_SECTOR_ART_FILE:
+                {
+                    DEBUG_PRINT("READ_SECTOR_ART_FILE\n");
+                    needFileCheckAction = FileListingStates::PROCESS_READ_SECTOR_ART_FILE;
+                    artFileReady = 0;
+                    break;
+                }
+                
 				case COMMAND_EXTENDED:
 				{
 					switch (command.custom_cmd.arg >> 1)

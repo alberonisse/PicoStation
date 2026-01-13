@@ -91,8 +91,8 @@ class MechCommand {
 		COMMAND_IO_DATA = 0x7,
 		COMMAND_EXTENDED = 0x8,
 		COMMAND_BOOTLOADER = 0xA,
-        COMMAND_READ_ART_FILE = 0xB
-        
+        COMMAND_READ_ART_FILE = 0xB,
+        COMMAND_READ_SECTOR_ART_FILE = 0xC,
 	};
 
 	enum EXTENDED_CMD

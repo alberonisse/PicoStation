@@ -7,6 +7,7 @@
 const size_t c_maxFilePathLength = 255;
 const size_t c_maxFileEntriesPerSector = 8;
 
+
 static inline int endsWithIgnoreCase(const char* str, const char* suf)
 {
     if (!str || !suf) return 0;

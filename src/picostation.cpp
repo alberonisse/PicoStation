@@ -12,6 +12,7 @@
 #include "i2s.h"
 #include "logging.h"
 #include "main.pio.h"
+#include "psx_pad_sniff.pio.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include "pseudo_atomics.h"
@@ -53,6 +54,8 @@ unsigned int picostation::g_subqOffset;
 
 static uint8_t s_resetPending = 0;
 
+
+
 static picostation::PWMSettings pwmDataClock = 
 {
 	.gpio = Pin::DA15,
@@ -82,6 +85,8 @@ static picostation::PWMSettings pwmMainClock =
 
 static void initPWM(picostation::PWMSettings *settings);
 
+static void printDiagnostics();
+
 static void __time_critical_func(interruptHandler)(unsigned int gpio, uint32_t events)
 {
     static uint64_t lastLowEvent = 0;
@@ -107,14 +112,10 @@ static void __time_critical_func(interruptHandler)(unsigned int gpio, uint32_t e
                 const uint64_t c_now = time_us_64();
                 const uint64_t c_timeElapsed = c_now - lastLowEvent;
                 
-                if (c_timeElapsed >= 50000U)  // Debounce, only reset if the pin was low for more than 50000us(50 ms)
-                {
-                    if (c_timeElapsed >= 1000000U) // pressed more one second
-					{
+                if (c_timeElapsed >= 50000U){  // Debounce, only reset if the pin was low for more than 50000us(50 ms)
+                    if (c_timeElapsed >= 1000000U){ // pressed more one second
 						s_resetPending = 2;
-					}
-					else
-					{
+					}else{
 						s_resetPending = 1;
 					}
                 }
@@ -143,7 +144,7 @@ static void __time_critical_func(interruptHandler)(unsigned int gpio, uint32_t e
                 const uint64_t c_timeElapsed = c_now - lastLowEventDoor;
                 if (c_timeElapsed >= 50000U)  // Debounce, only reset if the pin was low for more than 50000us(50 ms)
                 {
-                    m_i2s.s_doorPending = true;
+                    m_i2s.s_doorPending = 1;
                 }
                 
                 // Enable the low signal edge detection again
@@ -173,18 +174,216 @@ static void __time_critical_func(send_subq)(const int Sector)
 	picostation::g_subqDelay = false;
 }
 
+//=====================================================
+// PSX_PAD_SNIFF_POLL
+// Extracted from the functional original (ManiacVera)
+// https://github.com/ManiacVera/PicoIGR
+//=====================================================
+#define PSX_CLKDIV 50
+#define PSX_PIO    pio1
+#define PSX_SM_CMD 0
+#define PSX_SM_DAT 1
+#define PAD_READ 0x42
+
+typedef enum {
+    WAIT_CMD,
+    WAIT_TAP,
+    WAIT_DAT0,
+    WAIT_DAT1
+} PsxPadState;
+
+enum Action {
+	ACTION_NONE,
+	ACTION_SHORT_RESET,
+	ACTION_LONG_RESET,
+};
+
+PsxPadState psxPadState = WAIT_CMD;
+static uint8_t dat0 = 0;
+volatile Action detected_action = ACTION_NONE;
+volatile bool ready_to_process = false;
+static bool psx_frame_consumed = false;
+static bool combo_lock = false;
+
+// Bitfield PSX – active-high (apos ^ 0xFFFF)
+// bit = 1 -> botão pressionado
+// bit = 0 -> botão solto
+#define BTN_MASK_SELECT    (1u << 0)
+#define BTN_MASK_L3        (1u << 1)
+#define BTN_MASK_R3        (1u << 2)
+#define BTN_MASK_START     (1u << 3)
+#define BTN_MASK_UP        (1u << 4)
+#define BTN_MASK_RIGHT     (1u << 5)
+#define BTN_MASK_DOWN      (1u << 6)
+#define BTN_MASK_LEFT      (1u << 7)
+#define BTN_MASK_L2        (1u << 8)
+#define BTN_MASK_R2        (1u << 9)
+#define BTN_MASK_L1        (1u << 10)
+#define BTN_MASK_R1        (1u << 11)
+#define BTN_MASK_TRIANGLE  (1u << 12)
+#define BTN_MASK_CIRCLE    (1u << 13)
+#define BTN_MASK_X         (1u << 14)
+#define BTN_MASK_SQUARE    (1u << 15)
+//-------------------------
+#define MASK_SHORT_RESET  (BTN_MASK_SELECT | BTN_MASK_START | BTN_MASK_L2 | BTN_MASK_R2)
+#define MASK_LONG_RESET   (BTN_MASK_SELECT | BTN_MASK_L2 | BTN_MASK_R2 | BTN_MASK_X)
+//-------------------------
+
+
+void __time_critical_func(do_reset)(uint32_t sleepMS) {
+	gpio_set_dir(Pin::RESET_OUT, GPIO_OUT);
+	gpio_put(Pin::RESET_OUT, 0);
+    absolute_time_t start = get_absolute_time();
+    while (absolute_time_diff_us(start, get_absolute_time()) < (int64_t)sleepMS * 1000){
+        tight_loop_contents();
+    }
+	gpio_put(Pin::RESET_OUT, 1);
+	gpio_set_dir(Pin::RESET_OUT, GPIO_IN);
+	gpio_pull_up(Pin::RESET_OUT);
+}
+
+static inline void psx_pad_sniff_cmd_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = psx_pad_sniff_cmd_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, Pin::PAD_CMD);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_CMD, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_ATT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_CLK, 1, false);
+
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, PSX_CLKDIV);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void psx_pad_sniff_dat_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = psx_pad_sniff_dat_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, Pin::PAD_DAT);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_DAT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_ATT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::PAD_CLK, 1, false);
+
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, PSX_CLKDIV);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline uint8_t psx_pad_pio_read(PIO pio, uint sm){
+    return (uint8_t)(pio_sm_get(pio, sm) >> 24);
+}
+
+void psx_pad_sniff_init(void){
+    uint off_cmd = pio_add_program(PSX_PIO, &psx_pad_sniff_cmd_program);
+    uint off_dat = pio_add_program(PSX_PIO, &psx_pad_sniff_dat_program);
+    psx_pad_sniff_cmd_init(PSX_PIO, PSX_SM_CMD, off_cmd);
+    psx_pad_sniff_dat_init(PSX_PIO, PSX_SM_DAT, off_dat);
+    pio_sm_set_enabled(PSX_PIO, PSX_SM_CMD, true);
+    pio_sm_set_enabled(PSX_PIO, PSX_SM_DAT, true);
+}
+
+void __time_critical_func(psx_pad_sniff_poll)(){
+    switch (psxPadState)
+    {
+        case WAIT_CMD:
+        {
+            // Novo frame começa quando ATT vai LOW
+            if (gpio_get(Pin::PAD_ATT) == 0)
+                psx_frame_consumed = false;
+
+            if (psx_frame_consumed)
+                return;
+
+            if (pio_sm_is_rx_fifo_empty(PSX_PIO, PSX_SM_CMD))
+                return;
+
+            uint8_t cmd = psx_pad_pio_read(PSX_PIO, PSX_SM_CMD);
+            if (cmd == PAD_READ)
+                psxPadState = WAIT_TAP;
+
+            break;
+        }
+
+        case WAIT_TAP:
+        {
+            if (pio_sm_is_rx_fifo_empty(PSX_PIO, PSX_SM_CMD))
+                return;
+
+            // Ignora TAP
+            psx_pad_pio_read(PSX_PIO, PSX_SM_CMD);
+            psxPadState = WAIT_DAT0;
+            break;
+        }
+
+        case WAIT_DAT0:
+        {
+            if (pio_sm_is_rx_fifo_empty(PSX_PIO, PSX_SM_DAT))
+                return;
+
+            dat0 = psx_pad_pio_read(PSX_PIO, PSX_SM_DAT);
+            psxPadState = WAIT_DAT1;
+            break;
+        }
+
+        case WAIT_DAT1:
+        {
+            if (pio_sm_is_rx_fifo_empty(PSX_PIO, PSX_SM_DAT))
+                return;
+
+            uint8_t dat1 = psx_pad_pio_read(PSX_PIO, PSX_SM_DAT);
+            uint16_t buttons = (dat1 | (dat0 << 8)) ^ 0xFFFF;
+
+            // ================= COMBOS =================
+            bool short_reset_now = ((buttons & MASK_SHORT_RESET) == MASK_SHORT_RESET);
+            bool long_reset_now = ((buttons & MASK_LONG_RESET) == MASK_LONG_RESET);
+            // ================= DISPARO (1x POR PRESS) =================
+            if (!combo_lock)
+            {
+                if (short_reset_now)
+                {
+                    detected_action = ACTION_SHORT_RESET;
+                    ready_to_process = true;
+                    combo_lock = true;
+                }
+                else if (long_reset_now)
+                {
+                    detected_action = ACTION_LONG_RESET;
+                    ready_to_process = true;
+                    combo_lock = true;
+                }
+            }
+
+            // LIBERA AO SOLTAR
+            if (combo_lock && !short_reset_now && !long_reset_now)
+                combo_lock = false;
+                
+            // Frame consumed
+            psx_frame_consumed = true;
+            psxPadState = WAIT_CMD;
+            break;
+        }
+    }
+}
+//=====================================================
+
+
 [[noreturn]] void __time_critical_func(picostation::core0Entry)()
 {
     g_coreReady[0] = true;
-    while (!g_coreReady[1].Load())
-    {
+    while (!g_coreReady[1].Load()){
         tight_loop_contents();
     }
+    
+    while (true){
 
-    while (true)
-    {
-        if (s_resetPending)
-        {
+        if (s_resetPending){
             while (gpio_get(Pin::RESET) == 0)
             {
                 tight_loop_contents();
@@ -216,7 +415,7 @@ static void __time_critical_func(send_subq)(const int Sector)
         else if (m_mechCommand.getSens(SENS::GFS))
         {
             if (m_i2s.getSectorSending() == currentSector)
-            {
+            {        
                 g_driveMechanics.moveToNextSector();
                 g_subqDelay = true;
 
@@ -227,11 +426,41 @@ static void __time_critical_func(send_subq)(const int Sector)
 					}, (void *) currentSector, true);
             }
         }
+
+        // PSX_PAD_SNIFF_POLL
+        //-----------------------------------
+        psx_pad_sniff_poll();
+        if (ready_to_process) {
+			ready_to_process = false;
+			switch (detected_action) {
+    			case ACTION_SHORT_RESET: 
+                    detected_action = ACTION_NONE;
+                    do_reset(1);
+                    ready_to_process = false;
+                    s_resetPending = 1;
+                    reset();
+                break;
+    			case ACTION_LONG_RESET:  
+                    detected_action = ACTION_NONE;
+                	do_reset(1);
+                	ready_to_process = false;
+                    s_resetPending = 2;
+                    reset();
+                break;
+    			default: 
+                    detected_action = ACTION_NONE;
+                break;
+			}
+		}
+        //-----------------------------------
+
     }
 }
 
-[[noreturn]] void picostation::core1Entry()
-{
+
+
+[[noreturn]] void picostation::core1Entry(){
+    // SISTEMA NORMAL
     m_i2s.start(m_mechCommand);
     while (1) asm("");
     __builtin_unreachable();
@@ -253,7 +482,7 @@ void __time_critical_func(picostation::initHW)()
     {
         gpio_init(pin);
     }
-    
+
     gpio_put(Pin::SD_CS, 1);
     gpio_set_dir(Pin::SD_CS, GPIO_OUT);
     
@@ -290,10 +519,9 @@ void __time_critical_func(picostation::initHW)()
 	gpio_set_function(Pin::EXP_I2C0_SCL, GPIO_FUNC_I2C);
 	gpio_pull_up(Pin::EXP_I2C0_SDA);
 	gpio_pull_up(Pin::EXP_I2C0_SCL);
-	
+
 	// Initialize the Si5351
-	if (si5351_Init(0))
-	{
+	if (si5351_Init(0)){
 		si5351_SetupCLK1(53203425, SI5351_DRIVE_STRENGTH_8MA);
 		si5351_SetupCLK2(53693175, SI5351_DRIVE_STRENGTH_8MA);
 		si5351_EnableOutputs((1<<1) | (1<<2));
@@ -321,16 +549,14 @@ void __time_critical_func(picostation::initHW)()
     sleep_ms(300);
     gpio_set_dir(Pin::RESET, GPIO_IN);
 
-    while ((time_us_64() - startTime) < 30000)
-    {
+    while ((time_us_64() - startTime) < 30000){
         if (gpio_get(Pin::RESET) == 0)
         {
             startTime = time_us_64();
         }
     }
 
-    while ((time_us_64() - startTime) < 30000)
-    {
+    while ((time_us_64() - startTime) < 30000){
         if (gpio_get(Pin::CMD_CK) == 0)
         {
             startTime = time_us_64();
@@ -345,13 +571,14 @@ void __time_critical_func(picostation::initHW)()
     
     pio_set_irq0_source_enabled(PIOInstance::MECHACON, (enum pio_interrupt_source)pis_interrupt0, true);
     
-    
     pio_interrupt_clear(PIOInstance::MECHACON, 0);
     irq_set_exclusive_handler(PIO0_IRQ_0, mech_irq_hnd);
     irq_set_enabled(PIO0_IRQ_0, true);
 
     g_coreReady[0] = false;
     g_coreReady[1] = false;
+
+    psx_pad_sniff_init();
 
     DEBUG_PRINT("ON!\n");
 }
@@ -373,9 +600,7 @@ void __time_critical_func(picostation::updatePlaybackSpeed)()
 {
     static constexpr unsigned int c_clockDivNormal = 4;
     static constexpr unsigned int c_clockDivDouble = 2;
-
-    if (s_currentPlaybackSpeed != g_targetPlaybackSpeed)
-    {
+    if (s_currentPlaybackSpeed != g_targetPlaybackSpeed){
         s_currentPlaybackSpeed = g_targetPlaybackSpeed;
         const unsigned int clock_div = (s_currentPlaybackSpeed == 1) ? c_clockDivNormal : c_clockDivDouble;
         pwm_set_mask_enabled(0);
@@ -388,9 +613,11 @@ void __time_critical_func(picostation::updatePlaybackSpeed)()
     }
 }
 
+
 void __time_critical_func(picostation::reset)()
 {
     DEBUG_PRINT("RESET!\n");
+    
     m_i2s.i2s_set_state(0);
     pio_sm_set_enabled(PIOInstance::SUBQ, SM::SUBQ, false);
     pio_sm_set_enabled(PIOInstance::SOCT, SM::SOCT, false);
@@ -403,13 +630,11 @@ void __time_critical_func(picostation::reset)()
     g_targetPlaybackSpeed = 1;
     updatePlaybackSpeed();
     
-    if (s_resetPending == 2)
-    {
-        if (s_dataLocation != picostation::DiscImage::DataLocation::RAM)
-		{
+    if (s_resetPending == 2){
+        if (s_dataLocation != picostation::DiscImage::DataLocation::RAM){
 			g_discImage.unload();
 			g_discImage.makeDummyCue();
-			m_i2s.menu_active = true;
+			m_i2s.menu_active = 1;
 			g_discImage.set_skip_bootsector(false);
 			g_discImage.set_skip_edc(false);
             m_mechCommand.setFirstClvModeStopKickPattern(true);
@@ -441,8 +666,7 @@ void __time_critical_func(picostation::reset)()
 		}
 	}
 	
-	while ((time_us_64() - startTime) < 30000)
-	{
+	while ((time_us_64() - startTime) < 30000){
 		if (gpio_get(Pin::CMD_CK) == 0)
 		{
 			startTime = time_us_64();
@@ -453,5 +677,5 @@ void __time_critical_func(picostation::reset)()
     
 	s_resetPending = 0;
 	gpio_set_irq_enabled(Pin::RESET, GPIO_IRQ_LEVEL_LOW, true);
-}
 
+}

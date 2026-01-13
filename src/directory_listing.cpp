@@ -10,7 +10,7 @@
 #include "global.h"
 #include "ff.h"
 #include "listingBuilder.h"
-#include "ArtFile.h"
+#include "AlbFile.h"
 #include "logging.h"
 
 #if DEBUG_FILEIO
@@ -26,33 +26,35 @@ namespace
 {
     char currentDirectory[c_maxFilePathLength + 1];
     listingBuilder* fileListing;
-    ArtFile* artFile;
+    AlbFile* albFile;
 }  // namespace
 
 static FATFS s_fatFS;
 static bool sd_present = false;
 
-
 bool __time_critical_func(DirectoryListing::initBoot)(){
     sd_present = false;
     FRESULT fr = f_mount(&s_fatFS, "", 1);
-    gotoRoot();
-	if (FR_OK == fr){
+	if (FR_OK == fr)
+	{
 		sd_present = true;
 		//panic("f_mount error: (%d)\n", fr);
+        currentDirectory[0] = '\0';
         uint16_t cnt = getCueCount();
         return cnt == 1;
 	}
     return false;
 }
 
-void __time_critical_func(DirectoryListing::init)(){
+void __time_critical_func(DirectoryListing::init)()
+{
+    currentDirectory[0] = '\0';
     fileListing = new listingBuilder();
-    artFile = new ArtFile();
-    //gotoRoot();
+    albFile = new AlbFile();
 }
 
-void __time_critical_func(DirectoryListing::gotoRoot)(){ 
+void __time_critical_func(DirectoryListing::gotoRoot)()
+{ 
     currentDirectory[0] = '\0';
 }
 
@@ -60,10 +62,12 @@ bool __time_critical_func(DirectoryListing::gotoDirectory)(const uint32_t index)
 { 
     char newFolder[c_maxFilePathLength + 1];
     bool result = getDirectoryEntry(index, newFolder); 
+    
     if (result)
     {
         combinePaths(currentDirectory, newFolder, currentDirectory);
     }
+    
     DEBUG_PRINT("gotoDirectory: %s\n", currentDirectory);
     return result;
 }
@@ -105,6 +109,7 @@ void __time_critical_func(DirectoryListing::gotoParentDirectory)()
 
     currentDirectory[0] = '\0';
 }
+
 
 static inline bool acceptEntry(const FILINFO* e){
     // Não aceita ocultos
@@ -159,8 +164,10 @@ bool __time_critical_func(DirectoryListing::getDirectoryEntries)(const uint32_t 
         
         while (true)
         {
-            if (acceptEntry(&currentEntry)) {
-                if (filesProcessed >= offset) {
+            if (acceptEntry(&currentEntry))
+            {
+                if (filesProcessed >= offset)
+                {
                     if (fileListing->addString(currentEntry.fname, currentEntry.fattrib & AM_DIR ? 1 : 0) == false)
                     {
                         break;
@@ -215,6 +222,139 @@ bool __time_critical_func(DirectoryListing::getDirectoryEntries)(const uint32_t 
     return true;
 }
 
+uint16_t __time_critical_func(DirectoryListing::getDirectoryEntriesCount)()
+{
+    DIR dir;
+    FILINFO currentEntry;
+    FILINFO nextEntry;
+    
+	if (!sd_present)
+	{
+		return 0;
+	}
+    
+    FRESULT res = f_opendir(&dir, currentDirectory);
+    
+    if (res != FR_OK)
+    {
+        DEBUG_PRINT("f_opendir error: (%d)\n", res);
+        return 0;
+    }
+
+    uint16_t fileEntryCount = 0;
+    bool hasNext = false;
+
+    res = f_readdir(&dir, &currentEntry);
+    
+    if (res == FR_OK && currentEntry.fname[0] != '\0')
+    {
+        res = f_readdir(&dir, &nextEntry);
+        hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
+        
+        while (true)
+        {
+            if (acceptEntry(&currentEntry))
+            {
+				fileEntryCount++;
+				
+				if (fileEntryCount >= 4096)
+				{
+					hasNext = 0;
+				}
+            }
+            
+            if (hasNext == 0)
+            {
+                break;
+            }
+            
+            currentEntry = nextEntry;
+            res = f_readdir(&dir, &nextEntry);
+            hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
+        }
+    }
+    
+    f_closedir(&dir);
+    return fileEntryCount;
+}
+
+uint16_t* __time_critical_func(DirectoryListing::getFileListingData)()
+{
+    return fileListing->getData();
+}
+
+// Private
+
+void __time_critical_func(DirectoryListing::combinePaths)(const char* filePath1, const char* filePath2, char* newPath)
+{ 
+    char result[c_maxFilePathLength + 1];
+    strncpy(result, filePath1, c_maxFilePathLength);
+    
+    if (strnlen(result, c_maxFilePathLength) > 0)
+    {
+        strncat(result, "/", c_maxFilePathLength);
+    }
+    
+    strncat(result, filePath2, c_maxFilePathLength);
+    strncpy(newPath, result, c_maxFilePathLength);
+}
+
+bool __time_critical_func(DirectoryListing::getDirectoryEntry)(const uint32_t index, char* filePath)
+{
+    if (index >= 4096)
+    {
+        return false;
+    }
+
+    DIR dir;
+    FILINFO currentEntry;
+    FILINFO nextEntry;
+    FRESULT res = f_opendir(&dir, currentDirectory);
+    
+    if (res != FR_OK)
+    {
+        DEBUG_PRINT("f_opendir error: (%d)\n", res);
+        return false;
+    }
+
+    uint32_t filesProcessed = 0;
+
+    res = f_readdir(&dir, &currentEntry);
+    
+    if (res == FR_OK && currentEntry.fname[0] != '\0')
+    {
+        res = f_readdir(&dir, &nextEntry);
+        bool hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
+        
+        while (true)
+        {
+            if (acceptEntry(&currentEntry))
+            {
+                if (filesProcessed == index)
+                {
+                    strncpy(filePath, currentEntry.fname, c_maxFilePathLength);
+                    f_closedir(&dir);
+                    return true;
+                }
+                
+                filesProcessed++;
+            }
+            
+            if (!hasNext)
+            {
+                break;
+            }
+            
+            currentEntry = nextEntry;
+            res = f_readdir(&dir, &nextEntry);
+            hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
+        }
+    }
+
+    f_closedir(&dir);
+    return false;
+}
+
 
 uint16_t __time_critical_func(DirectoryListing::getCueCount)()
 {
@@ -259,187 +399,87 @@ uint16_t __time_critical_func(DirectoryListing::getCueCount)()
     return fileEntryCount;
 }
 
-uint16_t __time_critical_func(DirectoryListing::getDirectoryEntriesCount)()
-{
-    DIR dir;
-    FILINFO currentEntry;
-    FILINFO nextEntry;
-    
-	if (!sd_present){
-		return 0;
-	}
-    
-    FRESULT res = f_opendir(&dir, currentDirectory);
-    
-    if (res != FR_OK)
-    {
-        DEBUG_PRINT("f_opendir error: (%d)\n", res);
-        return 0;
-    }
-
-    uint16_t fileEntryCount = 0;
-    bool hasNext = false;
-
-    res = f_readdir(&dir, &currentEntry);
-    
-    if (res == FR_OK && currentEntry.fname[0] != '\0')
-    {
-        res = f_readdir(&dir, &nextEntry);
-        hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
-        
-        while (true){
-            if (acceptEntry(&currentEntry)){
-				fileEntryCount++;
-				
-				if (fileEntryCount >= 4096)
-				{
-					hasNext = 0;
-				}
-            }
-            
-            if (hasNext == 0)
-            {
-                break;
-            }
-            
-            currentEntry = nextEntry;
-            res = f_readdir(&dir, &nextEntry);
-            hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
-        }
-    }
-    
-    f_closedir(&dir);
-    return fileEntryCount;
-}
-
-uint16_t* __time_critical_func(DirectoryListing::getFileListingData)()
-{
-    return fileListing->getData();
-}
-
-
-
-
-// Private
-
-void __time_critical_func(DirectoryListing::combinePaths)(const char* filePath1, const char* filePath2, char* newPath)
-{ 
-    char result[c_maxFilePathLength + 1];
-    strncpy(result, filePath1, c_maxFilePathLength);
-    
-    if (strnlen(result, c_maxFilePathLength) > 0)
-    {
-        strncat(result, "/", c_maxFilePathLength);
-    }
-    
-    strncat(result, filePath2, c_maxFilePathLength);
-    strncpy(newPath, result, c_maxFilePathLength);
-}
-
-bool __time_critical_func(DirectoryListing::getDirectoryEntry)(const uint32_t index, char* filePath){
-    if (index >= 4096){
-        return false;
-    }
-
-    DIR dir;
-    FILINFO currentEntry;
-    FILINFO nextEntry;
-    FRESULT res = f_opendir(&dir, currentDirectory);
-    
-    if (res != FR_OK)
-    {
-        DEBUG_PRINT("f_opendir error: (%d)\n", res);
-        return false;
-    }
-
-    uint32_t filesProcessed = 0;
-
-    res = f_readdir(&dir, &currentEntry);
-    
-    if (res == FR_OK && currentEntry.fname[0] != '\0')
-    {
-        res = f_readdir(&dir, &nextEntry);
-        bool hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
-        
-        while (true)
-        {
-            if (acceptEntry(&currentEntry)){
-                if (filesProcessed == index)
-                {
-                    strncpy(filePath, currentEntry.fname, c_maxFilePathLength);
-                    f_closedir(&dir);
-                    return true;
-                }
-                filesProcessed++;
-            }
-            
-            if (!hasNext)
-            {
-                break;
-            }
-            
-            currentEntry = nextEntry;
-            res = f_readdir(&dir, &nextEntry);
-            hasNext = (res == FR_OK && nextEntry.fname[0] != '\0');
-        }
-    }
-
-    f_closedir(&dir);
-    return false;
-}
-
-
-uint16_t* __time_critical_func(DirectoryListing::getArtFileData)()
-{
-    return artFile->getData();
-}
 
 bool DirectoryListing::buildArtFile(const uint32_t indexFile)
 {
-    DEBUG_PRINT("buildArtFile: indexFile=%u\n", indexFile);
-
-    artFile->clear();
-
     char base[64] = {0};
-    if (!getDirectoryEntry(indexFile, base)){
-        DEBUG_PRINT("Erro buildArtPath\n");
+    if (!getDirectoryEntry(indexFile, base)) {
+        DEBUG_PRINT("buildArtFile:00\n");
         return false;
     }
-    bool isCue  = endsWithIgnoreCase(base, ".cue");
-    if (isCue){
+
+    // remove .cue
+    if (endsWithIgnoreCase(base, ".cue")) {
         char* dot = strrchr(base, '.');
-        if (dot)
-            *dot = 0;
+        if (dot) *dot = 0;
     }
 
-    char artPath[c_maxFilePathLength+1];
-    snprintf(artPath, c_maxFilePathLength, "/ART/%s.art", base);    
-    DEBUG_PRINT("ART_PATH %s\n", artPath);
+    char artPath[c_maxFilePathLength + 1];
+    snprintf(artPath, sizeof(artPath), "/ART/%s.art", base);
 
     FIL file;
-    UINT tryOpenTmp = f_open(&file, artPath, FA_READ);
-    DEBUG_PRINT("f_open return = %u\n", tryOpenTmp);
-    if (tryOpenTmp != FR_OK) {
-        DEBUG_PRINT("f_open FAILED code=%d\n", tryOpenTmp);
-        artFile->setStatus(0);
+    if (f_open(&file, artPath, FA_READ) != FR_OK) {
+        DEBUG_PRINT("buildArtFile:01\n");
         return false;
     }
 
-    UINT fileSize = f_size(&file);
-    if(fileSize > artFile->maxArtFile()){
-        artFile->setStatus(0);
-        return false; 
+    const uint32_t fileSize = f_size(&file);
+    if (fileSize == 0 || fileSize > ALB_UTIL_DATA_ALL_SIZE) {
+        f_close(&file);
+        DEBUG_PRINT("buildArtFile:02 fileSize=%u\n", fileSize);
+        return false;
     }
 
-    uint8_t* dst = artFile->rawBuffer() + 4;
+    const uint8_t qntSectors = (fileSize + ALB_UTIL_DATA_SECTOR_SIZE - 1) / ALB_UTIL_DATA_SECTOR_SIZE;
+
+    albFile->begin(indexFile, qntSectors);
+
+    uint32_t offset = 0;
     UINT br = 0;
-    f_read(&file, dst, fileSize, &br);
+
+    for (uint8_t i = 0; i < qntSectors; i++) {
+        const uint32_t remaining = fileSize - offset;
+        const uint16_t toRead = (remaining < ALB_UTIL_DATA_SECTOR_SIZE) ? remaining : ALB_UTIL_DATA_SECTOR_SIZE;
+        if (f_read(&file, albFile->payload(i), toRead, &br) != FR_OK || br != toRead) {
+            DEBUG_PRINT("buildArtFile:03 toRead=%u, br=%u, Sector=%u\n", toRead, br, i);
+            f_close(&file);
+            albFile->cancel();
+            return false;
+        }
+        albFile->setStatus(i, 1);
+        offset += toRead;
+    }
+    DEBUG_PRINT("buildArtFile:Sucesso\n");
     f_close(&file);
-
-    artFile->setStatus(1);        //SUCESSO
-    artFile->setDataSize(4 + br); // Atualiza tamanho final
-
+    albFile->resetRead(); // Leitura começa do setor 0
     return true;
 }
+
+uint16_t* __time_critical_func(DirectoryListing::getAlbFileCurrentData)()
+{
+    return (albFile && albFile->valid()) ? albFile->currentData() : nullptr;
+}
+
+bool __time_critical_func(DirectoryListing::advanceAlbFile)(uint8_t requested)
+{
+    if (!albFile || !albFile->valid()) {
+        return false;
+    }
+    return albFile->advance(requested);
+}
+
+uint8_t __time_critical_func(DirectoryListing::getAlbFileCurrentSector)()
+{
+    if (!albFile || !albFile->valid()) {
+        return 0;
+    }
+    return albFile->currentSector();
+}
+
+void __time_critical_func(DirectoryListing::cancelAlbFile)()
+{
+    albFile->cancel();
+}
+
 }  // namespace picostation
 

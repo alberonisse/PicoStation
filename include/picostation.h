@@ -22,6 +22,7 @@ enum class FileListingStates {
     MOUNT_FILE,
     PROCESS_FILES,
     PROCESS_READ_ART_FILE,
+    PROCESS_READ_SECTOR_ART_FILE,
 };
 
 extern pseudoatomic<FileListingStates> g_fileListingState;
