@@ -1,3 +1,9 @@
+//=====================================================
+// PSX_PAD_SNIFF_POLL
+// Extracted from the functional original (ManiacVera)
+// https://github.com/ManiacVera/PicoIGR
+//=====================================================
+
 Short Reset: START + SELECT + L2 + R2
 
 Long Reset: SELECT + L2 + R2 + X
