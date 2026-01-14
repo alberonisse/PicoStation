@@ -235,7 +235,7 @@ int __time_critical_func(picostation::I2S::initDMA)(const volatile void *read_ad
 		else if (s_doorPending && !menu_active)
 		{
 			s_doorPending = false;
-			if (++loadedImageIndex > img_count)
+			if (++loadedImageIndex >= img_count) //Because with 3 games the valid indexes are 0, 1, 2 (img_count = 3), when it goes from 2 to 3 (>= img_count) it resets to **0; using > img_count` allows index 3 (invalid) and only then resets, requiring the door to be opened and closed twice in a row.
 			{
 				loadedImageIndex = 0;
 			}
