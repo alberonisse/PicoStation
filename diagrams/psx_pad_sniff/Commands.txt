@@ -4,6 +4,5 @@
 // https://github.com/ManiacVera/PicoIGR
 //=====================================================
 
-Short Reset: START + SELECT + L2 + R2
-
-Long Reset: SELECT + L2 + R2 + X
+Long Reset: START + SELECT + X
+Short Reset: START + SELECT + CIRCLE
