@@ -235,7 +235,7 @@ int __time_critical_func(picostation::I2S::initDMA)(const volatile void *read_ad
 		else if (s_doorPending && !menu_active)
 		{
 			s_doorPending = false;
-			if (++loadedImageIndex > img_count)
+			if (++loadedImageIndex >= img_count)
 			{
 				loadedImageIndex = 0;
 			}
