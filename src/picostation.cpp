@@ -19,6 +19,10 @@
 #include "values.h"
 #include "si5351.h"
 
+#if CONTROLLER_SNIFF
+    #include "controller_sniff.pio.h"
+#endif
+
 #if DEBUG_MAIN
 #define DEBUG_PRINT(...) printf(__VA_ARGS__)
 #else
@@ -173,6 +177,248 @@ static void __time_critical_func(send_subq)(const int Sector)
 	picostation::g_subqDelay = false;
 }
 
+//=====================================================
+// CONTROLLER_SNIFF
+// Inspired from the functional original (ManiacVera)
+// https://github.com/ManiacVera/PicoIGR
+//=====================================================
+#if CONTROLLER_SNIFF
+
+#define CONT_CLKDIV 50
+#define CONT_PIO    pio1
+#define CONT_SM_CMD 0
+#define CONT_SM_DAT 1
+#define PAD_READ 0x42
+
+typedef enum {
+    WAIT_CMD,
+    WAIT_TAP,
+    WAIT_DAT0,
+    WAIT_DAT1
+} ContState;
+
+enum Action {
+	ACTION_NONE,
+	ACTION_SHORT_RESET,
+	ACTION_LONG_RESET
+};
+
+ContState contState = WAIT_CMD;
+static uint8_t dat0 = 0;
+volatile Action detected_action = ACTION_NONE;
+volatile bool ready_to_process = false;
+static bool cont_frame_consumed = false;
+static bool combo_lock = false;
+
+static absolute_time_t frame_start_time;
+static bool valid_pad_frame = false;
+
+// Contagem de hold
+static uint32_t hold_frames = 0;
+#define HOLD_FRAMES_500MS 30   // ~500 ms a 60Hz
+
+// Bitfield PSX – active-high (apos ^ 0xFFFF)
+// bit = 1 -> botão pressionado
+// bit = 0 -> botão solto
+#define BTN_MASK_SELECT    (1u << 0)
+#define BTN_MASK_L3        (1u << 1)
+#define BTN_MASK_R3        (1u << 2)
+#define BTN_MASK_START     (1u << 3)
+#define BTN_MASK_UP        (1u << 4)
+#define BTN_MASK_RIGHT     (1u << 5)
+#define BTN_MASK_DOWN      (1u << 6)
+#define BTN_MASK_LEFT      (1u << 7)
+#define BTN_MASK_L2        (1u << 8)
+#define BTN_MASK_R2        (1u << 9)
+#define BTN_MASK_L1        (1u << 10)
+#define BTN_MASK_R1        (1u << 11)
+#define BTN_MASK_TRIANGLE  (1u << 12)
+#define BTN_MASK_CIRCLE    (1u << 13)
+#define BTN_MASK_X         (1u << 14)
+#define BTN_MASK_SQUARE    (1u << 15)
+//-------------------------
+#define MASK_SHORT_RESET  (BTN_MASK_START | BTN_MASK_SELECT | BTN_MASK_CIRCLE)
+#define MASK_LONG_RESET   (BTN_MASK_START | BTN_MASK_SELECT | BTN_MASK_X)
+#define MASK_RETURN_MENU  (BTN_MASK_START | BTN_MASK_SELECT | BTN_MASK_TRIANGLE)
+//-------------------------
+
+void __time_critical_func(picostation::do_reset)(uint32_t sleepMS) {
+	gpio_set_dir(Pin::RESET_OUT, GPIO_OUT);
+	gpio_put(Pin::RESET_OUT, 0);
+    absolute_time_t start = get_absolute_time();
+    while (absolute_time_diff_us(start, get_absolute_time()) < (int64_t)sleepMS * 1000){
+        tight_loop_contents();
+    }
+	gpio_put(Pin::RESET_OUT, 1);
+	gpio_set_dir(Pin::RESET_OUT, GPIO_IN);
+    gpio_disable_pulls(Pin::RESET_OUT);
+}
+
+static inline void controller_cmd_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = controller_cmd_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, Pin::CONT_CMD);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_CMD, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_ATT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_CLK, 1, false);
+
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, CONT_CLKDIV);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void controller_dat_init(PIO pio, uint sm, uint offset)
+{
+    pio_sm_config c = controller_dat_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, Pin::CONT_DAT);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_DAT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_ATT, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, Pin::CONT_CLK, 1, false);
+
+    sm_config_set_in_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, CONT_CLKDIV);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline uint8_t cont_read(PIO pio, uint sm){
+    return (uint8_t)(pio_sm_get(pio, sm) >> 24);
+}
+
+void controller_init(void){
+    uint off_cmd = pio_add_program(CONT_PIO, &controller_cmd_program);
+    uint off_dat = pio_add_program(CONT_PIO, &controller_dat_program);
+    controller_cmd_init(CONT_PIO, CONT_SM_CMD, off_cmd);
+    controller_dat_init(CONT_PIO, CONT_SM_DAT, off_dat);
+    pio_sm_set_enabled(CONT_PIO, CONT_SM_CMD, true);
+    pio_sm_set_enabled(CONT_PIO, CONT_SM_DAT, true);
+}
+
+void __time_critical_func(controller_poll)(){
+    switch (contState)
+    {
+        case WAIT_CMD:
+        {
+            if (gpio_get(Pin::CONT_ATT) == 0) {
+                cont_frame_consumed = false;
+                frame_start_time = get_absolute_time();
+            }
+
+            if (cont_frame_consumed)
+                return;
+
+            if (pio_sm_is_rx_fifo_empty(CONT_PIO, CONT_SM_CMD))
+                return;
+
+            uint8_t cmd = cont_read(CONT_PIO, CONT_SM_CMD);
+
+            if (cmd == PAD_READ) {
+                valid_pad_frame = true;
+                contState = WAIT_TAP;
+            } else {
+                // não é leitura de controle
+                valid_pad_frame = false;
+                cont_frame_consumed = true;
+                contState = WAIT_CMD;
+            }
+            break;
+        }
+
+        case WAIT_TAP:
+        {
+            if (pio_sm_is_rx_fifo_empty(CONT_PIO, CONT_SM_CMD))
+                return;
+
+            // Ignora TAP
+            cont_read(CONT_PIO, CONT_SM_CMD);
+            contState = WAIT_DAT0;
+            break;
+        }
+
+        case WAIT_DAT0:
+        {
+            if (pio_sm_is_rx_fifo_empty(CONT_PIO, CONT_SM_DAT))
+                return;
+
+            dat0 = cont_read(CONT_PIO, CONT_SM_DAT);
+            contState = WAIT_DAT1;
+            break;
+        }
+
+        case WAIT_DAT1:
+        {
+            if (pio_sm_is_rx_fifo_empty(CONT_PIO, CONT_SM_DAT))
+                return;
+
+            uint8_t dat1 = cont_read(CONT_PIO, CONT_SM_DAT);
+
+            // Ignora se não for frame válido de controle
+            if (!valid_pad_frame) {
+                cont_frame_consumed = true;
+                contState = WAIT_CMD;
+                return;
+            }
+
+            // Ignora frame longo (memory card)
+            int64_t frame_us =
+                absolute_time_diff_us(frame_start_time, get_absolute_time());
+
+            if (frame_us > 1000) { // > 1 ms = suspeito
+                cont_frame_consumed = true;
+                contState = WAIT_CMD;
+                return;
+            }
+
+            uint16_t buttons = (dat1 | (dat0 << 8)) ^ 0xFFFF;
+
+            bool short_reset_now =
+                ((buttons & MASK_SHORT_RESET) == MASK_SHORT_RESET);
+
+            bool long_reset_now =
+                ((buttons & MASK_LONG_RESET) == MASK_LONG_RESET);
+
+            // ================= HOLD 500ms =================
+            if (short_reset_now || long_reset_now) {
+                hold_frames++;
+            } else {
+                hold_frames = 0;
+            }
+
+            if (hold_frames >= HOLD_FRAMES_500MS && !combo_lock) {
+                if (short_reset_now) {
+                    detected_action = ACTION_SHORT_RESET;
+                } else if (long_reset_now) {
+                    detected_action = ACTION_LONG_RESET;
+                }
+                ready_to_process = true;
+                combo_lock = true;
+            }
+
+            // Libera ao soltar
+            if (!short_reset_now && !long_reset_now) {
+                combo_lock = false;
+                hold_frames = 0;
+            }
+
+            cont_frame_consumed = true;
+            contState = WAIT_CMD;
+            break;
+        }
+    }
+}
+#endif
+//=====================================================
+
+
+
+
 [[noreturn]] void __time_critical_func(picostation::core0Entry)()
 {
     g_coreReady[0] = true;
@@ -227,6 +473,33 @@ static void __time_critical_func(send_subq)(const int Sector)
 					}, (void *) currentSector, true);
             }
         }
+
+        #if CONTROLLER_SNIFF
+            controller_poll();
+            if (ready_to_process) {
+    			ready_to_process = false;
+    			switch (detected_action) {
+        			case ACTION_SHORT_RESET: 
+                        detected_action = ACTION_NONE;
+                        do_reset(100);
+                        ready_to_process = false;
+                        s_resetPending = 1;
+                        reset();
+                    break;
+        			case ACTION_LONG_RESET:  
+                        detected_action = ACTION_NONE;
+                    	do_reset(100);
+                    	ready_to_process = false;
+                        s_resetPending = 2;
+                        reset();
+                    break;                
+        			default: 
+                        detected_action = ACTION_NONE;
+                    break;
+    			}
+    		}    
+        #endif
+
     }
 }
 
@@ -253,6 +526,24 @@ void __time_critical_func(picostation::initHW)()
     {
         gpio_init(pin);
     }
+
+    #if CONTROLLER_SNIFF
+        gpio_init(Pin::RESET_OUT);
+
+        // SEM PULLS
+        gpio_disable_pulls(Pin::CONT_DAT);
+        gpio_disable_pulls(Pin::CONT_CMD);
+        gpio_disable_pulls(Pin::CONT_CLK);
+        gpio_disable_pulls(Pin::CONT_ATT);
+        gpio_disable_pulls(Pin::RESET_OUT);
+
+        // Garante entrada real
+        gpio_set_dir(Pin::CONT_DAT, GPIO_IN);
+        gpio_set_dir(Pin::CONT_CMD, GPIO_IN);
+        gpio_set_dir(Pin::CONT_CLK, GPIO_IN);
+        gpio_set_dir(Pin::CONT_ATT, GPIO_IN);
+        gpio_set_dir(Pin::RESET_OUT, GPIO_IN);
+    #endif
     
     gpio_put(Pin::SD_CS, 1);
     gpio_set_dir(Pin::SD_CS, GPIO_OUT);
@@ -346,6 +637,10 @@ void __time_critical_func(picostation::initHW)()
 
     g_coreReady[0] = false;
     g_coreReady[1] = false;
+
+    #if CONTROLLER_SNIFF
+        controller_init();
+    #endif
 
     DEBUG_PRINT("ON!\n");
 }

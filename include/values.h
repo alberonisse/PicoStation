@@ -7,6 +7,7 @@
 
 #include "picostation_pinout.h"
 
+
 // GPIO pinouts
 namespace Pin {
 enum : unsigned int {
@@ -37,7 +38,12 @@ enum : unsigned int {
     EXP_I2C1_SCL = GPIO_EXP_I2C1_SCL,
     EXP_BUTTON0 = GPIO_EXP_BUTTON0,
     EXP_BUTTON1 = GPIO_EXP_BUTTON1,
-    EXP_BUTTON2 = GPIO_EXP_BUTTON2
+    EXP_BUTTON2 = GPIO_EXP_BUTTON2,
+    CONT_CMD = GPIO_CONT_CMD,
+    CONT_DAT = GPIO_CONT_DAT,
+    CONT_ATT = GPIO_CONT_ATT,
+    CONT_CLK = GPIO_CONT_CLK,
+    RESET_OUT = GPIO_RESET_OUT
 };
 constexpr unsigned int allPins[] = {SD_CS, XLAT, SQCK, LMTSW, SCEX_DATA, DOOR, RESET, SENS, DA15,
                                     DA16, LRCK, SCOR,  SQSO,      CLK,  CMD_DATA, CMD_CK};

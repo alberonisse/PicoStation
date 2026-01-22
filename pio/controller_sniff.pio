@@ -1,0 +1,43 @@
+; =========================================================
+; CONTROLLER_SNIFF - READ ONLY
+; Extracted from the functional original (Daniele Giuliani)
+; =========================================================
+
+.define PUBLIC PIN_CMD  3
+.define PUBLIC PIN_DAT  5
+.define PUBLIC PIN_ATT  20
+.define PUBLIC PIN_CLK  22
+
+; =========================================================
+; CMD READER
+; =========================================================
+.program controller_cmd
+
+wait_att_low:
+    wait 0 gpio PIN_ATT
+    set x, 7
+
+cmd_bitloop:
+    wait 0 gpio PIN_CLK
+    wait 1 gpio PIN_CLK
+    in pins, 1
+    jmp x-- cmd_bitloop
+
+.wrap
+
+; =========================================================
+; DAT READER
+; =========================================================
+.program controller_dat
+
+wait_att_low:
+    wait 0 gpio PIN_ATT
+    set x, 7
+
+dat_bitloop:
+    wait 0 gpio PIN_CLK
+    wait 1 gpio PIN_CLK
+    in pins, 1
+    jmp x-- dat_bitloop
+
+.wrap
