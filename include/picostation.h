@@ -54,5 +54,6 @@ extern unsigned int g_audioCtrlMode;
 void initHW();
 void updatePlaybackSpeed();
 void reset();
+void do_reset(uint32_t sleepMS);
 }  // namespace picostation
 

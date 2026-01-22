@@ -262,6 +262,13 @@ void __time_critical_func(picostation::MechCommand::processLatchedCommand)()
 					listReadyState = 0;
 					break;
 				}
+
+                case COMMAND_GET_COVER_ART:
+				{
+					needFileCheckAction = FileListingStates::GET_COVER_ART;
+					listReadyState = 0;
+					break;
+				}
 				
 				case COMMAND_BOOTLOADER:
 				{

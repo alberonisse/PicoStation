@@ -123,12 +123,26 @@ int __time_critical_func(picostation::I2S::initDMA)(const volatile void *read_ad
     uint64_t endTime;
 #endif
 
-    g_discImage.makeDummyCue();
-	
-    // this need to be moved to diskimage
-    picostation::DirectoryListing::init();
-    picostation::DirectoryListing::getDirectoryEntries(0);
-
+    char autoBootFile[128] = {0};
+    uint8_t autoBootFileCount = picostation::DirectoryListing::checkAutoBoot(autoBootFile);
+    if(autoBootFileCount>0){
+        //printf("AUTO BOOT\n");
+		s_dataLocation = picostation::DiscImage::DataLocation::SDCard;
+		loadedImageIndex = 0;
+		g_discImage.load(autoBootFile);
+		img_count = autoBootFileCount;
+		reinitI2S();
+		g_driveMechanics.resetDrive();
+		g_discImage.set_skip_bootsector(false);
+		mechCommand.resetBootSectorPattern();
+    }else{
+        menu_active = true;
+        g_discImage.makeDummyCue();
+        // this need to be moved to diskimage
+        picostation::DirectoryListing::init();
+        picostation::DirectoryListing::getDirectoryEntries(0);
+    }
+    
     while (true)
     {
         // Sector could change during the loop, so we need to keep track of it
@@ -192,8 +206,11 @@ int __time_critical_func(picostation::I2S::initDMA)(const volatile void *read_ad
 					g_discImage.set_skip_bootsector(false);
 					mechCommand.resetBootSectorPattern();
 
+                    #if CONTROLLER_SNIFF
+                        picostation::do_reset(100);
+                    #endif
+
 					continue;
-					break;
 				}
 				
 				case picostation::FileListingStates::PROCESS_FILES:
@@ -211,6 +228,17 @@ int __time_critical_func(picostation::I2S::initDMA)(const volatile void *read_ad
 					if (!listReadyState.Load())
 					{
 						picostation::DirectoryListing::openCover(g_fileArg.Load());
+						needFileCheckAction = picostation::FileListingStates::PROCESS_FILES;
+						listReadyState = 1;
+					}
+					break;
+				}
+
+                case picostation::FileListingStates::GET_COVER_ART:
+				{
+					if (!listReadyState.Load())
+					{
+						picostation::DirectoryListing::openCoverArt(g_fileArg.Load());
 						needFileCheckAction = picostation::FileListingStates::PROCESS_FILES;
 						listReadyState = 1;
 					}

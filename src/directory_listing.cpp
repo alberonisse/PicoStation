@@ -32,23 +32,140 @@ static FIL cfg_fp;
 static FATFS s_fatFS;
 static bool sd_present = false;
 
-void __time_critical_func(DirectoryListing::init)()
+
+static inline bool is_digit(char c){
+    return (c >= '0' && c <= '9');
+}
+
+static inline int endsWithIgnoreCase(const char* str, const char* suf)
+{
+    if (!str || !suf) return 0;
+    const char *p = str;
+    const char *s = suf;
+    while (*p) ++p;
+    while (*s) ++s;
+    size_t lenStr = (size_t)(p - str);
+    size_t lenSuf  = (size_t)(s - suf);
+    if (lenSuf > lenStr) return 0;
+    p = str + (lenStr - lenSuf);
+    s = suf;
+    while (*s) {
+        unsigned char a = (unsigned char)*p++;
+        unsigned char b = (unsigned char)*s++;
+        // tolower ASCII sem ctype:
+        if (a >= 'A' && a <= 'Z') a |= 0x20;
+        if (b >= 'A' && b <= 'Z') b |= 0x20;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static bool extractTrailingNumber(const char* name, int* outNum, size_t* outPrefixLen)
+{
+    size_t len = strlen(name);
+    size_t i = len;
+
+    // anda para tras enquanto for digito
+    while (i > 0 && is_digit(name[i - 1])) {
+        i--;
+    }
+
+    if (i == len) return false; // nenhum número no final
+
+    *outNum = atoi(&name[i]);
+    *outPrefixLen = i;
+    return true;
+}
+
+static inline bool acceptEntry(const FILINFO* e, bool acceptDir=true){
+    if (e->fattrib & AM_HID) return false;
+    bool isDir = (e->fattrib & AM_DIR) != 0;
+    bool isArtDir = false;
+    bool isCue = false;
+    if (isDir) {
+        if(!acceptDir) return false;
+        // aceita diretório somente se NÃO terminar com "ART" (case-insensitive)
+        isArtDir = endsWithIgnoreCase(e->fname, "ART");
+    } else {
+        // aceita arquivo se terminar com ".cue" (case-insensitive)
+        isCue = endsWithIgnoreCase(e->fname, ".cue");
+    }
+    return (isDir && !isArtDir) || isCue;
+}
+
+uint8_t __time_critical_func(DirectoryListing::checkAutoBoot)(char *filePath)
 {
     sd_present = false;
-    
+    FRESULT fr = f_mount(&s_fatFS, "", 1);
+	if (FR_OK == fr){
+		sd_present = true;
+	}
+    gotoRoot();
+    if(!sd_present) return 0;
+
+    DIR dir; FILINFO currentEntry; FILINFO nextEntry;
+    uint8_t fileEntryCount = 0; bool valid = false;
+    if (!sd_present) return 0;
+    if (!filePath) return 0;
+
+    if (f_opendir(&dir, currentDirectory) != FR_OK) return 0;
+
+    bool hasNext = false; char basePrefix[128] = {0}; int expectedNumber = 0;
+    if (f_readdir(&dir, &currentEntry) == FR_OK && currentEntry.fname[0] != '\0')
+    {
+        f_readdir(&dir, &nextEntry);
+        hasNext = (nextEntry.fname[0] != '\0');
+
+        while (true)
+        {
+            if (!acceptEntry(&currentEntry, false))
+                goto cleanup;
+
+            if (++fileEntryCount > 5)
+                goto cleanup;
+
+            int number; size_t prefixLen;
+            if (!extractTrailingNumber(currentEntry.fname, &number, &prefixLen))
+                goto cleanup;
+
+            if (fileEntryCount == 1) {
+                strncpy(filePath, currentEntry.fname, 127);
+                filePath[127] = '\0';
+                memcpy(basePrefix, currentEntry.fname, prefixLen);
+                basePrefix[prefixLen] = '\0';
+                expectedNumber = number;
+            } else  {
+                if (strncmp(currentEntry.fname, basePrefix, prefixLen) != 0)
+                    goto cleanup;
+
+                if (number != expectedNumber + 1)
+                    goto cleanup;
+
+                expectedNumber = number;
+            }
+
+            if (!hasNext){
+                valid = true;
+                break;
+            }
+
+            currentEntry = nextEntry;
+            f_readdir(&dir, &nextEntry);
+            hasNext = (nextEntry.fname[0] != '\0');
+        }
+    }
+
+cleanup:
+    f_closedir(&dir);
+
+    return valid ? fileEntryCount : 0;
+}
+
+void __time_critical_func(DirectoryListing::init)()
+{    
     memset(&cover_fp, 0, sizeof(FIL));
     memset(&cfg_fp, 0, sizeof(FIL));
-    
-    FRESULT fr = f_mount(&s_fatFS, "", 1);
-	
-	if (FR_OK == fr)
-	{
-		sd_present = true;
-		//panic("f_mount error: (%d)\n", fr);
-	}
-    
     fileListing = new listingBuilder();
-    gotoRoot();
 }
 
 void __time_critical_func(DirectoryListing::gotoRoot)()
@@ -145,7 +262,7 @@ bool __time_critical_func(DirectoryListing::getDirectoryEntries)(const uint32_t 
         
         while (true)
         {
-            if (!(currentEntry.fattrib & AM_HID) && (currentEntry.fattrib & AM_DIR || strcasestr(currentEntry.fname, ".cue")))
+            if (acceptEntry(&currentEntry, true))
             {
                 if (filesProcessed >= offset)
                 {
@@ -234,7 +351,7 @@ uint16_t __time_critical_func(DirectoryListing::getDirectoryEntriesCount)()
         
         while (true)
         {
-            if (!(currentEntry.fattrib & AM_HID) && (currentEntry.fattrib & AM_DIR || strcasestr(currentEntry.fname, ".cue")))
+            if (acceptEntry(&currentEntry, true))
             {
 				fileEntryCount++;
 				
@@ -309,7 +426,7 @@ bool __time_critical_func(DirectoryListing::getDirectoryEntry)(const uint32_t in
         
         while (true)
         {
-            if (!(currentEntry.fattrib & AM_HID) && (currentEntry.fattrib & AM_DIR || strcasestr(currentEntry.fname, ".cue")))
+            if (acceptEntry(&currentEntry, true))
             {
                 if (filesProcessed == index)
                 {
@@ -366,6 +483,32 @@ void __time_critical_func(DirectoryListing::openCover)(const uint32_t index)
 	DEBUG_PRINT("openCover: %s\n", filePath);
 
 	f_open(&cover_fp, filePath, FA_READ);
+}
+
+void __time_critical_func(DirectoryListing::openCoverArt)(const uint32_t indexFile)
+{
+    char artPath[c_maxFilePathLength + 1];
+
+    if (cover_fp.obj.fs){
+		f_close(&cover_fp);
+	}
+
+    if (!sd_present) return;
+	
+    char base[128] = {0};
+    if (!getDirectoryEntry(indexFile, base)) {
+        return;
+    }
+
+    // remove .cue
+    if (endsWithIgnoreCase(base, ".cue")) {
+        char* dot = strrchr(base, '.');
+        if (dot) *dot = 0;
+    }
+    
+    snprintf(artPath, sizeof(artPath), "/ART/%s.art", base);
+
+    f_open(&cover_fp, artPath, FA_READ);
 }
 
 uint16_t* __time_critical_func(DirectoryListing::readCover)(const uint32_t part)
